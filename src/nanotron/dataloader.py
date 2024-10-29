@@ -9,14 +9,17 @@ from torch.utils.data.distributed import DistributedSampler
 
 from nanotron import distributed as dist
 from nanotron import logging
-from nanotron.config import Config
+from nanotron.config import Config, PretrainDatasetsArgs
+from nanotron.logging import log_rank
 from nanotron.parallel import ParallelContext
 from nanotron.parallel.pipeline_parallel.tensor_pointer import TensorPointer
+from nanotron.parallel.pipeline_parallel.utils import get_input_output_pp_ranks
 from nanotron.random import set_random_seed
 from nanotron.sanity_checks import (
     assert_fail_except_rank_with,
     assert_tensor_synced_across_pg,
 )
+from nanotron.utils import main_rank_first
 
 try:
     import datasets
@@ -27,15 +30,340 @@ try:
         Sequence,
         Value,
         concatenate_datasets,
+        interleave_datasets,
         load_dataset,
     )
-    from transformers import PreTrainedTokenizerBase
+    from huggingface_hub import __version__ as hf_hub_version
+    from transformers import AutoTokenizer, PreTrainedTokenizerBase
+    from transformers import __version__ as tf_version
     from transformers.trainer_pt_utils import DistributedSamplerWithLoop
 except ImportError:
     warnings.warn("Datasets and/or Transformers not installed, you'll be unable to use the dataloader.")
+    hf_hub_version = None
+    tf_version = None
 
 
 logger = logging.get_logger(__name__)
+
+
+class CombinedDataset(Dataset):
+    def __init__(self, datasets: List[Dataset], weights: torch.Tensor, seed: int):
+        assert len(datasets) == len(weights)
+        assert weights.sum() == 1.0
+        assert weights.ndim == 1
+
+        for i in range(len(datasets)):
+            assert all(x["dataset_idxs"] == i for x in datasets[i])
+
+        self.datasets = datasets
+        self.comebined_dataset = concatenate_datasets(datasets)
+        # self.comebined_dataset = interleave_datasets(datasets, weights.tolist(), stopping_strategy="first_exhausted", seed=42)
+        # self.comebined_dataset = interleave_datasets(datasets, stopping_strategy="first_exhausted", seed=42)
+        # assert 1 == 1
+
+    def __len__(self) -> int:
+        return len(self.comebined_dataset)
+
+    def __getitem__(self, batch: Union[int, List[int]]) -> Dict[str, Union[torch.Tensor, np.array]]:
+        if isinstance(batch, list) is False:
+            batch = [batch]
+
+        assert len(batch) > 0
+        if isinstance(batch[0], list):
+            # TODO(xrsrke): do a single index, then split the output
+            samples = [self.comebined_dataset[idxs] for idxs in batch]
+            return self._merge_dicts(samples)
+
+        return self.comebined_dataset[batch]
+
+    def _merge_dicts(self, data):
+        merged = {}
+        for key in data[0].keys():
+            merged[key] = np.concatenate([d[key] for d in data if key in d])
+        return merged
+
+
+import math
+
+
+class WeightedDistributedSampler(DistributedSampler):
+    def __init__(
+        self,
+        weights: torch.Tensor,
+        datasets: List[Dataset],
+        batch_size: int,
+        num_microbatches: int,
+        num_replicas: int,
+        rank: int,
+        parallel_context: ParallelContext,
+        shuffle: bool = False,
+        seed: int = 42,
+        drop_last: bool = False,
+    ):
+        super().__init__(datasets, num_replicas=num_replicas, rank=rank, shuffle=shuffle, drop_last=drop_last)
+
+        self.weights = weights
+        self.datasets = datasets
+        self.batch_size = batch_size
+        self.num_microbatches = num_microbatches
+        self.parallel_context = parallel_context
+        self.total_size = self._calculate_total_size()
+
+        self.lengths = [len(d) for d in self.datasets]
+        self.offsets = np.cumsum([0] + self.lengths[:-1])
+        self.seed = seed
+
+        # self.global_batch_size = batch_size * dist.get_world_size(parallel_context.dp_pg) * num_microbatches
+        self.global_batch_size = batch_size * self.num_replicas * num_microbatches
+        # NOTE: Reset the seed of the generator for consistent randomness across epochs
+        self.generator = torch.Generator(device="cpu").manual_seed(
+            seed * (1 + dist.get_rank(self.parallel_context.dp_pg)) * (1 + dist.get_rank(self.parallel_context.pp_pg))
+        )
+
+        self.reset()
+
+    def _calculate_total_size(self):
+        total_samples = sum(len(d) for d in self.datasets)
+        return math.ceil(total_samples / self.batch_size) * self.batch_size
+
+    def __iter__(self):
+        return self
+
+    def _recompute_domain_batch_sizes(self, domain_weights):
+        domain_batch_sizes = [round(self.global_batch_size * weight.item()) for weight in domain_weights]
+
+        # NOTE: in some cases, the weight of a domain is too small
+        # resulting in a domain with 0 samples per global batch
+        # => zero loss for that domain => we no longer update the weights of that domain
+        # so we add a sample to that domain
+        domain_batch_sizes = [1 if x < 1 else x for x in domain_batch_sizes]
+
+        if sum(domain_batch_sizes) != self.global_batch_size:
+            # NOTE: randomly add a sample to round it up
+            domain_batch_sizes = self._round_up_domain_batch_sizes(
+                domain_batch_sizes,
+                target_total_size=self.global_batch_size,
+            )
+
+        assert all(x > 0 for x in domain_batch_sizes), "There is a domain with 0 samples per global batch"
+        return domain_batch_sizes
+
+    def __next__(self):
+        if self.microbatch_idx == 0:
+            # NOTE: because we randomly add a sample to round up the domain batch sizes
+            # so it's better if we recompute the global batch every time we start a new microbatch
+            # so that not bias towards a domain (where that domain gets more samples than the others)
+            self.domain_batch_sizes = self._recompute_domain_batch_sizes(
+                domain_weights=self.weights,
+            )
+
+            self.batch = []
+            for domain_index, (idxs, domain_batch_size) in enumerate(
+                zip(self.domain_indices, self.domain_batch_sizes)
+            ):
+                start_idx = self.domain_counters[domain_index]
+                end_idx = start_idx + domain_batch_size
+
+                if end_idx > len(idxs):
+                    raise StopIteration(f"Domain {domain_index}-th ran out of samples")
+
+                assert self.domain_counters[domain_index] + domain_batch_size == end_idx
+                self.domain_counters[domain_index] = end_idx
+                global_batch_idxs = idxs[start_idx:end_idx]
+                self.batch.extend(global_batch_idxs)
+
+        num_samples_per_dp_rank = self.batch_size * self.num_microbatches
+        dp_start_idx = self.rank * num_samples_per_dp_rank
+        dp_end_idx = dp_start_idx + num_samples_per_dp_rank
+
+        if dp_end_idx > len(self.batch):
+            raise StopIteration(f"[DoReMi] Rank {self.rank} ran out of samples, len(batch)={len(self.batch)}")
+
+        dp_batch = self.batch[dp_start_idx:dp_end_idx]
+
+        microbatch_start_idx = self.microbatch_idx * self.batch_size
+        microbatch_end_idx = microbatch_start_idx + self.batch_size
+
+        if microbatch_end_idx > len(dp_batch):
+            raise StopIteration(
+                f"[DoReMi] Rank {self.rank}'s microbatch {self.microbatch_idx}-th ran out of samples, len(dp_batch)={len(dp_batch)}"
+            )
+
+        microbatch_idxs = dp_batch[microbatch_start_idx:microbatch_end_idx]
+
+        if self.microbatch_idx == self.num_microbatches - 1:
+            self.microbatch_idx = 0
+        else:
+            self.microbatch_idx += 1
+
+        return microbatch_idxs
+
+    def _recompute_global_batch(self):
+        self.domain_batch_sizes = self._recompute_domain_batch_sizes(
+            domain_weights=self.weights,
+        )
+        for domain_index, (idxs, domain_batch_size) in enumerate(zip(self.domain_indices, self.domain_batch_sizes)):
+            start_idx = self.domain_counters[domain_index]
+            end_idx = start_idx + domain_batch_size
+
+            if end_idx > len(idxs):
+                raise StopIteration(f"Domain {domain_index}-th ran out of samples")
+
+            self.domain_counters[domain_index] = end_idx
+            global_batch_idxs = idxs[start_idx:end_idx]
+            self.batch.extend(global_batch_idxs)
+
+    def _round_up_domain_batch_sizes(self, domain_batch_sizes: List[int], target_total_size: int) -> List[int]:
+        """
+        NOTE: Makes sum(domain_batch_sizes) == batch_size
+        """
+        total_batch_size = sum(domain_batch_sizes)
+        while total_batch_size != target_total_size:
+            diff = target_total_size - total_batch_size
+
+            # NOTE: Randomly select a domain to increase/decrase a sample
+            # to match the target_total_size
+            eligible_indices = torch.nonzero(torch.tensor(domain_batch_sizes) > 1).view(-1)
+            random_index = torch.randint(
+                low=0, high=len(eligible_indices), size=(1,), generator=self.generator, device="cpu"
+            ).item()
+            selected_domain = eligible_indices[random_index].item()
+
+            if diff > 0:
+                domain_batch_sizes[selected_domain] += 1
+            elif diff < 0 and domain_batch_sizes[selected_domain] > 0:
+                domain_batch_sizes[selected_domain] -= 1
+
+            total_batch_size = sum(domain_batch_sizes)
+
+        return domain_batch_sizes
+
+    def reset(self):
+        """Reset the state of the sampler for a new epoch."""
+        self.microbatch_idx = 0
+        self.domain_counters = [0 for _ in self.datasets]
+        self.total_samples_yielded = 0
+        self.out_of_samples = False
+
+        domain_indices = []
+        for i, dataset in enumerate(self.datasets):
+            local_indices = torch.arange(0, len(dataset), device="cpu").tolist()
+
+            # NOTE: align the indices across the combined dataset
+            global_indices = local_indices + self.offsets[i]
+            domain_indices.append(global_indices)
+
+        self.num_samples_per_global_step = self.batch_size * self.num_microbatches * self.num_replicas
+        self.domain_indices = domain_indices
+        self.expected_total_samples = sum([len(d) for d in domain_indices])
+
+
+import abc
+from dataclasses import dataclass
+
+
+@dataclass
+class BaseMegatronSampler:
+    total_samples: int
+    consumed_samples: int
+    micro_batch_size: int
+    data_parallel_rank: int
+    data_parallel_size: int
+    global_batch_size: int
+    drop_last: bool = True
+    pad_samples_to_global_batch_size: Optional[bool] = False
+
+    def __post_init__(self):
+        self.micro_batch_times_data_parallel_size = self.micro_batch_size * self.data_parallel_size
+
+        # Sanity checks.
+        if self.total_samples <= 0:
+            raise RuntimeError("no sample to consume: {}".format(self.total_samples))
+        if self.consumed_samples >= self.total_samples:
+            raise RuntimeError("no samples left to consume: {}, {}".format(self.consumed_samples, self.total_samples))
+        if self.micro_batch_size <= 0:
+            raise RuntimeError(f"micro_batch_size size must be greater than 0, but {self.micro_batch_size}")
+        if self.data_parallel_size <= 0:
+            raise RuntimeError(f"data parallel size must be greater than 0, but {self.data_parallel_size}")
+        if self.data_parallel_rank >= self.data_parallel_size:
+            raise RuntimeError(
+                "data_parallel_rank should be smaller than data size, but {} >= {}".format(
+                    self.data_parallel_rank, self.data_parallel_size
+                )
+            )
+        if self.global_batch_size % (self.micro_batch_size * self.data_parallel_size) != 0:
+            raise RuntimeError(
+                f"`global_batch_size` ({self.global_batch_size}) is not divisible by "
+                f"`micro_batch_size ({self.micro_batch_size}) x data_parallel_size "
+                f"({self.data_parallel_size})`"
+            )
+        if self.pad_samples_to_global_batch_size and self.global_batch_size is None:
+            raise RuntimeError(
+                "`pad_samples_to_global_batch_size` can be `True` only when "
+                "`global_batch_size` is set to an integer value"
+            )
+        log_rank(
+            f"Instantiating MegatronPretrainingSampler with total_samples: {self.total_samples} and consumed_samples: {self.consumed_samples}",
+            logger=logger,
+            level=logging.INFO,
+            rank=0,
+        )
+
+    @abc.abstractmethod
+    def __iter__(self):
+        ...
+
+
+@dataclass
+class MegatronPretrainingSampler(BaseMegatronSampler):
+    def get_start_end_idx(self):
+        start_idx = self.data_parallel_rank * self.micro_batch_size
+        end_idx = start_idx + self.micro_batch_size
+        return start_idx, end_idx
+
+    def __len__(self):
+        num_available_samples: int = self.total_samples - self.consumed_samples
+        if self.global_batch_size is not None:
+            if self.drop_last:
+                return num_available_samples // self.global_batch_size
+            else:
+                return (num_available_samples + self.global_batch_size - 1) // self.global_batch_size
+        else:
+            if self.drop_last:
+                return num_available_samples // self.micro_batch_times_data_parallel_size
+            else:
+                return (num_available_samples - 1) // self.micro_batch_times_data_parallel_size + 1
+
+    def __iter__(self):
+        batch = []
+        batch_idx = 0
+        # Last batch will be dropped if drop_last is not set False
+        for idx in range(self.consumed_samples, self.total_samples):
+            batch.append(idx)
+            if len(batch) == self.micro_batch_times_data_parallel_size:
+                start_idx, end_idx = self.get_start_end_idx()
+                log_rank(
+                    f"DLrank {self.data_parallel_rank} batch {batch_idx} {batch[start_idx:end_idx]} self.consumed_samples {self.consumed_samples}",
+                    logger=logger,
+                    level=logging.DEBUG,
+                )
+                yield batch[start_idx:end_idx]
+                batch = []
+                batch_idx += 1
+
+        # Check the last partial batch and see drop_last is set
+        if len(batch) > 0 and not self.drop_last:
+            if self.pad_samples_to_global_batch_size:
+                for i in range(
+                    self.data_parallel_rank, self.global_batch_size, self.micro_batch_times_data_parallel_size
+                ):
+                    indices = [batch[j] for j in range(i, max(len(batch), i + self.micro_batch_size))]
+                    num_pad = self.micro_batch_size - len(indices)
+                    indices = indices + [-1] * num_pad
+                    yield indices
+            else:
+                start_idx, end_idx = self.get_start_end_idx()
+                yield batch[start_idx:end_idx]
 
 
 def sanity_check_dataloader(
@@ -125,7 +453,7 @@ def get_datasets(
 
 
 # Adapted from h4/src/h4/data/loading.py
-def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "DatasetDict":
+def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed: int = 42) -> "DatasetDict":
     """
     Helper function to load dataset mix from dict configuration.
 
@@ -163,13 +491,18 @@ def _get_dataset_mix(dataset_dict: dict, splits: List[str] = None, seed=42) -> "
 
     if len(raw_train_datasets) > 0:
         train_subsets = []
-        for dataset, frac in zip(raw_train_datasets, fracs):
+        for dataset_idx, (dataset, frac) in enumerate(zip(raw_train_datasets, fracs)):
             train_subset = dataset.select(range(int(frac * len(dataset))))
+            train_subset = train_subset.add_column("dataset_idxs", [dataset_idx] * len(train_subset))
             train_subsets.append(train_subset)
         raw_datasets["train"] = concatenate_datasets(train_subsets).shuffle(seed=seed)
 
     # No subsampling for test datasets to enable fair comparison across models
     if len(raw_test_datasets) > 0:
+        test_subsets = []
+        for idx, dataset in enumerate(raw_test_datasets):
+            dataset = dataset.add_column("dataset_idxs", [idx] * len(dataset))
+            test_subsets.append(dataset)
         raw_datasets["test"] = concatenate_datasets(raw_test_datasets).shuffle(seed=seed)
 
     if len(raw_datasets) == 0:
@@ -283,6 +616,7 @@ def clm_process(
     dataset_processing_num_proc_per_process: int,
     dataset_overwrite_cache: bool,
     sequence_length: int,
+    dataset_idx: int,
 ):
     """Concatenate all texts from raw_dataset and generate chunks of `sequence_length + 1`, where chunks overlap by a single token."""
     # Adapted from https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/examples/pytorch/language-modeling/run_clm.py#L391-L439
@@ -319,6 +653,8 @@ def clm_process(
         load_from_cache_file=not dataset_overwrite_cache,
         desc=f"Grouping texts in chunks of {sequence_length+1}",
     )
+    # TODO(xrsrke): remove this shit
+    train_dataset = train_dataset.add_column("dataset_idxs", [dataset_idx] * len(train_dataset))
     return train_dataset
 
 
@@ -354,7 +690,8 @@ class DataCollatorForCLM:
             }
 
         # Make sure we load only what's necessary, ie we only load a `input_ids` column.
-        assert all(list(example.keys()) == ["input_ids"] for example in examples)
+        # assert all(list(example.keys()) == ["input_ids"] for example in examples)
+        assert all(list(example.keys()) == ["input_ids", "dataset_idxs"] for example in examples)
 
         # TODO @nouamanetazi: Is it better to have examples as np.array or torch.Tensor?
         input_ids = np.vstack([examples[i]["input_ids"] for i in range(len(examples))])  # (b, s)
@@ -366,6 +703,7 @@ class DataCollatorForCLM:
         result["input_mask"] = TensorPointer(group_rank=self.input_pp_rank)
         result["label_ids"] = TensorPointer(group_rank=self.output_pp_rank)
         result["label_mask"] = TensorPointer(group_rank=self.output_pp_rank)
+        result["dataset_idxs"] = TensorPointer(group_rank=self.output_pp_rank)
 
         assert (
             expanded_input_length == self.sequence_length + 1
@@ -380,6 +718,9 @@ class DataCollatorForCLM:
         if current_pp_rank == self.output_pp_rank:
             result["label_ids"] = input_ids[:, 1:]
             result["label_mask"] = np.ones((batch_size, self.sequence_length), dtype=np.bool_)
+
+            dataset_idxs = np.vstack([examples[i]["dataset_idxs"] for i in range(len(examples))])  # (b, s)
+            result["dataset_idxs"] = dataset_idxs
 
         if isinstance(result["input_ids"], torch.Tensor) and result["input_ids"].shape[-1] != self.sequence_length:
             raise ValueError(
@@ -402,6 +743,7 @@ def _get_train_sampler(
     dl_ranks_size: int,
     dl_rank: int,
     train_dataset: "Dataset",
+    shuffle: bool,
     seed: int,
     use_loop_to_round_batch_size: bool,
     consumed_train_samples: int,
@@ -426,7 +768,7 @@ def _get_train_sampler(
         )
     else:
         sampler = DistributedSampler(
-            train_dataset, num_replicas=dl_ranks_size, rank=dl_rank, seed=seed, drop_last=drop_last
+            train_dataset, num_replicas=dl_ranks_size, rank=dl_rank, shuffle=shuffle, seed=seed, drop_last=drop_last
         )
 
     if consumed_train_samples > 0:
@@ -449,6 +791,9 @@ def get_train_dataloader(
     dataloader_drop_last: bool = True,
     dataloader_pin_memory: bool = True,
     use_loop_to_round_batch_size: bool = False,
+    # TODO(xrsrke): refactor
+    weights: Optional[torch.Tensor] = None,
+    num_microbatches: Optional[int] = None,
 ) -> DataLoader:
     if not isinstance(train_dataset, datasets.Dataset):
         raise ValueError(f"training requires a datasets.Dataset, but got {type(train_dataset)}")
@@ -458,21 +803,28 @@ def get_train_dataloader(
         input_pp_rank,
         output_pp_rank,
     ]:
-        train_dataset = train_dataset.with_format(type="numpy", columns=["input_ids"], output_all_columns=True)
-
+        # for dataset_idx in range(len(train_dataset.comebined_dataset)):
+        #     d = train_dataset.comebined_dataset[dataset_idx]
+        #     train_dataset.comebined_dataset[dataset_idx] = d.with_format(type="numpy", columns=["input_ids"], output_all_columns=True)
+        pass
     # Case of ranks not requiring data. We give them an infinite dummy dataloader
     else:
-        #
-        assert train_dataset.column_names == ["input_ids"], (
-            f"Dataset has to have a single column, with `input_ids` as the column name. "
-            f"Current dataset: {train_dataset}"
-        )
+        # TODO(xrsrke): delete train_dataset from memory
+
         dataset_length = len(train_dataset)
-        train_dataset = train_dataset.remove_columns(column_names="input_ids")
-        assert (
-            len(train_dataset) == 0
-        ), f"Dataset has to be empty after removing the `input_ids` column. Current dataset: {train_dataset}"
-        # HACK as if we remove the last column of a train_dataset, it becomes empty and it's number of rows becomes empty.
+        # for dataset_idx in range(len(train_dataset.comebined_dataset)):
+        #     d = train_dataset.comebined_dataset[dataset_idx]
+        #     assert d.column_names == ["input_ids"], (
+        #         f"Dataset has to have a single column, with `input_ids` as the column name. "
+        #         f"Current dataset: {train_dataset}"
+        #     )
+        #     dataset_length = len(d)
+        #     d = d.remove_columns(column_names="input_ids")
+        #     assert (
+        #         len(d) == 0
+        #     ), f"Dataset has to be empty after removing the `input_ids` column. Current dataset: {d}"
+        #     # HACK as if we remove the last column of a train_dataset, it becomes empty and it's number of rows becomes empty.
+
         train_dataset = EmptyInfiniteDataset(length=dataset_length)
         # No need to spawn a lot of workers, we can just use main
         dataloader_num_workers = 0
@@ -491,23 +843,51 @@ def get_train_dataloader(
     # TODO @nouamanetazi: Remove unused columns: https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/src/transformers/trainer.py#L852
     # TODO @nouamanetazi: Support torch.utils.data.IterableDataset: https://github.com/huggingface/transformers/blob/47e1676255e5dd86b9541f734cd4f4bdcbb50f4a/src/transformers/trainer.py#L855-L872
 
-    train_sampler = _get_train_sampler(
-        dl_rank=dp_rank,
-        dl_ranks_size=dp_ranks_size,
-        train_dataset=train_dataset,
-        seed=seed_worker,
-        use_loop_to_round_batch_size=use_loop_to_round_batch_size,
-        micro_batch_size=micro_batch_size,
-        drop_last=dataloader_drop_last,
-        consumed_train_samples=consumed_train_samples,
+    train_sampler = WeightedDistributedSampler(
+        weights=weights,
+        datasets=train_dataset.datasets,
+        batch_size=micro_batch_size,
+        num_microbatches=num_microbatches,
+        num_replicas=dp_ranks_size,
+        rank=dp_rank,
+        seed=42,
+        drop_last=True,
+        parallel_context=parallel_context,
     )
+
+    # train_sampler = _get_train_sampler(
+    #     dl_rank=dp_rank,
+    #     dl_ranks_size=dp_ranks_size,
+    #     train_dataset=train_dataset,
+    #     shuffle=False,
+    #     seed=seed_worker,
+    #     use_loop_to_round_batch_size=use_loop_to_round_batch_size,
+    #     micro_batch_size=micro_batch_size,
+    #     drop_last=dataloader_drop_last,
+    #     consumed_train_samples=consumed_train_samples,
+    # )
+
+    # return DataLoader(
+    #     train_dataset,
+    #     shuffle=False,
+    #     batch_size=micro_batch_size,
+    #     batch_sampler=train_sampler,
+    #     collate_fn=data_collator,
+    #     drop_last=dataloader_drop_last,  # we also drop_last in `clm_process()`
+    #     num_workers=dataloader_num_workers,
+    #     pin_memory=dataloader_pin_memory,
+    #     worker_init_fn=get_dataloader_worker_init(dp_rank=dp_rank),
+    #     # TODO @thomasw21: I'm not sure but this doesn't seem to work at all.
+    #     # pin_memory_device="cuda",
+    # )
 
     return DataLoader(
         train_dataset,
-        batch_size=micro_batch_size,
-        sampler=train_sampler,
+        # shuffle=False,
+        # batch_size=micro_batch_size,
+        batch_sampler=train_sampler,
         collate_fn=data_collator,
-        drop_last=dataloader_drop_last,  # we also drop_last in `clm_process()`
+        # drop_last=dataloader_drop_last,  # we also drop_last in `clm_process()`
         num_workers=dataloader_num_workers,
         pin_memory=dataloader_pin_memory,
         worker_init_fn=get_dataloader_worker_init(dp_rank=dp_rank),
@@ -540,3 +920,109 @@ class EmptyInfiniteDataset:
 
     def __len__(self) -> int:
         return self._length
+
+
+def get_dataloader(trainer: "DistributedTrainer"):
+    """Returns a dataloader for training."""
+
+    # First, we need to know which ranks to feed the dataloader to
+    input_pp_rank, output_pp_rank = get_input_output_pp_ranks(model=trainer.model)
+
+    # Case 1: Dummy data generator
+    if trainer.config.data.dataset is None:
+        log_rank("Using dummy data generator", logger=logger, level=logging.INFO, rank=0)
+        dataloader = dummy_infinite_data_generator(
+            micro_batch_size=trainer.micro_batch_size,
+            sequence_length=trainer.sequence_length,
+            input_pp_rank=input_pp_rank,
+            output_pp_rank=output_pp_rank,
+            vocab_size=trainer.model_config.vocab_size,
+            seed=trainer.config.data.seed,
+            parallel_context=trainer.parallel_context,
+        )()
+
+    # Case 2: HuggingFace datasets
+    elif isinstance(trainer.config.data.dataset, PretrainDatasetsArgs):
+        log_rank("Using `datasets` library", logger=logger, level=logging.INFO, rank=0)
+        tokenizer_path = trainer.config.tokenizer.tokenizer_name_or_path
+        log_rank(
+            f"Loading tokenizer from {tokenizer_path} and transformers/hf_hub versions {tf_version, hf_hub_version}",
+            logger=logger,
+            level=logging.INFO,
+            rank=0,
+        )
+
+        # We need to the 1st device to process dataset and cache it, then other devices load from cache
+        with main_rank_first(trainer.parallel_context.world_pg):
+            # TODO @nouamanetazi: this may timeout before 1st device finishes processing dataset. Can we have a ctxmanager to modify timeout?
+            # TODO: generalise to include  for validation/test splits
+
+            # We load the raw dataset
+            raw_dataset = get_datasets(
+                hf_dataset_or_datasets=trainer.config.data.dataset.hf_dataset_or_datasets,
+                splits=trainer.config.data.dataset.hf_dataset_splits,
+            )["train"]
+
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.padding_side = "left"
+
+            num_datasets = len(trainer.config.data.dataset.hf_dataset_or_datasets)
+            if "dataset_idxs" in raw_dataset.column_names:
+                # assert num_datasets > 1, "Multiple datasets are required to use `dataset_idxs` column."
+
+                raw_datasets = []
+                for i in range(num_datasets):
+                    raw_datasets.append(raw_dataset.filter(lambda x: x["dataset_idxs"] == i))
+
+            # We apply the Causal Language Modeling preprocessing
+            tokenized_datasets = []
+            for dataset_idx in range(len(raw_datasets)):
+                d = raw_datasets[dataset_idx]
+                assert all(x["dataset_idxs"] == dataset_idx for x in d)
+                d = clm_process(
+                    raw_dataset=d,
+                    tokenizer=tokenizer,
+                    text_column_name=trainer.config.data.dataset.text_column_name,
+                    dataset_processing_num_proc_per_process=trainer.config.data.dataset.dataset_processing_num_proc_per_process,
+                    dataset_overwrite_cache=trainer.config.data.dataset.dataset_overwrite_cache,
+                    sequence_length=trainer.sequence_length,
+                    dataset_idx=dataset_idx,
+                )
+                d = d.with_format(type="numpy", columns=["input_ids"], output_all_columns=True)
+                tokenized_datasets.append(d)
+
+            assert all(x["dataset_idxs"] == i for i, d in enumerate(tokenized_datasets) for x in d)
+            weights = torch.tensor(list(trainer.config.data.dataset.hf_dataset_or_datasets.values()))
+            train_dataset = CombinedDataset(tokenized_datasets, weights, trainer.config.data.seed)
+
+            # We load the processed dataset on the ranks requiring it
+            dataloader = get_train_dataloader(
+                train_dataset=train_dataset,
+                sequence_length=trainer.sequence_length,
+                parallel_context=trainer.parallel_context,
+                input_pp_rank=input_pp_rank,
+                output_pp_rank=output_pp_rank,
+                micro_batch_size=trainer.micro_batch_size,
+                consumed_train_samples=trainer.consumed_train_samples,
+                dataloader_num_workers=trainer.config.data.num_loading_workers,
+                seed_worker=trainer.config.data.seed,
+                dataloader_drop_last=True,
+                weights=weights,
+                num_microbatches=trainer.n_micro_batches_per_batch,
+            )
+            # Check if we have enough samples for train_steps
+            total_tokens_dataset = len(dataloader.dataset) * trainer.sequence_length
+            num_tokens_needed_for_training = (
+                (trainer.config.tokens.train_steps - trainer.start_iteration_step)
+                * trainer.global_batch_size
+                * trainer.sequence_length
+            )
+            assert num_tokens_needed_for_training <= total_tokens_dataset, (
+                f"Dataset is too small for steps ({total_tokens_dataset} < {num_tokens_needed_for_training}), "
+                f"Try train_steps<={len(dataloader.dataset) // trainer.global_batch_size + trainer.start_iteration_step}"
+            )
+    else:
+        raise ValueError(f"Unhandled case of `self.config.data.dataset`. Got: {trainer.config.data.dataset}")
+
+    return dataloader
