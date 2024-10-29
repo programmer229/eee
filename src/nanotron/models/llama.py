@@ -1,28 +1,11 @@
 # coding=utf-8
-# Copyright 2018 HuggingFace Inc. team.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-""" PyTorch LLaMa model.
+""" PyTorch LLaMa model without FlashAttention.
 """
+
 from typing import Dict, Optional, Union
 
 import torch
-from flash_attn import bert_padding
-from flash_attn.flash_attn_interface import (
-    flash_attn_varlen_func,
-    flash_attn_with_kvcache,
-)
-from flash_attn.layers.rotary import RotaryEmbedding as FlashRotaryEmbedding
+import torch.nn.functional as F
 from torch import nn
 
 from nanotron import distributed as dist
@@ -60,14 +43,11 @@ class RotaryEmbedding(nn.Module):
         self.dim = dim
         self.end = end
         self.theta = theta
-        # TODO @nouamane: Figure out why we can't set `DTypeInvariantTensor` ...
-        # TODO @thomasw21: Complex buffers break DDP, instead we store float and view them as complex
         self.freqs_cis: torch.Tensor
         self._initialized_buffer = False
 
     def init_rotary_embeddings(self):
         if self._initialized_buffer is True:
-            # Buffer if already initialized
             return
         self.register_buffer(
             "freqs_cis",
@@ -75,7 +55,6 @@ class RotaryEmbedding(nn.Module):
             persistent=False,
         )
         assert self.freqs_cis.device.type == "cuda"
-        # TODO @nouamane: One we figure out how to do the DTypeInvariantTensor, this can be removed and changed to an assert
         if self.freqs_cis.dtype != torch.float:
             self.freqs_cis = self.freqs_cis.to(torch.float)
         assert self.freqs_cis.dtype == torch.float
@@ -98,7 +77,7 @@ class RotaryEmbedding(nn.Module):
         batch_size, seq_length, num_heads, inner_dim = x.shape
         while (
             position_ids is not None and position_ids[-1, -1] >= self.end
-        ) or seq_length >= self.end:  # TODO @nouamane: check if this causes cpu-gpu sync
+        ) or seq_length >= self.end:
             self.end *= 2
             self._initialized_buffer = False
         if self._initialized_buffer is False:
@@ -108,15 +87,14 @@ class RotaryEmbedding(nn.Module):
         assert inner_dim % 2 == 0
         x = x.view(
             batch_size, seq_length, num_heads, inner_dim // 2, 2
-        )  # [batch_size, q_length, num_heads, inner_dim]
+        )
         if x.dtype == torch.bfloat16:
             x = x.float()
-        complex_x = torch.view_as_complex(x)  # [batch_size, q_length, num_heads, inner_dim // 2]
+        complex_x = torch.view_as_complex(x)
         if position_ids is None:
             freqs_cis = self.freqs_cis[None, :seq_length, None, :]
         else:
-            # TODO(kunhao): Should None follow the num_heads dimension?
-            if position_ids[-1, -1] < 0 or position_ids[-1, -1] >= self.end:  # Quick test hopefully
+            if position_ids[-1, -1] < 0 or position_ids[-1, -1] >= self.end:
                 raise ValueError(f"Position ids must be in the range [0, {self.end}), but got {position_ids}")
             freqs_cis = self.freqs_cis[position_ids][:, :, None, :]
         complex_freqs = torch.view_as_complex(freqs_cis)
@@ -143,15 +121,14 @@ class MLP(nn.Module):
     ):
         super().__init__()
 
-        # TODO @thomasw21: refactor so that we store that default in a single place.
         tp_mode = parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE
         tp_linear_async_communication = (
             parallel_config.tp_linear_async_communication if parallel_config is not None else False
         )
 
         gate_up_contiguous_chunks = (
-            config.intermediate_size,  # shape of gate_linear
-            config.intermediate_size,  # shape of up_linear
+            config.intermediate_size,
+            config.intermediate_size,
         )
         self.gate_up_proj = TensorParallelColumnLinear(
             config.hidden_size,
@@ -171,7 +148,6 @@ class MLP(nn.Module):
             bias=False,
             async_communication=tp_linear_async_communication and tp_mode is TensorParallelLinearMode.REDUCE_SCATTER,
         )
-        # TODO @nouamane: why can't we torch.jit.script GLUActivation?
         self.split_silu_mul = GLUActivation(config.hidden_act)
 
     def forward(self, hidden_states):  # [seq_length, batch_size, hidden_dim]
@@ -180,79 +156,87 @@ class MLP(nn.Module):
         return {"hidden_states": hidden_states}
 
 
+def create_causal_mask(seq_len_q, seq_len_k, batch_size, num_heads, device):
+    # Create a causal mask where positions in the upper triangle are True (to be masked)
+    causal_mask = torch.triu(torch.ones((seq_len_q, seq_len_k), dtype=torch.bool, device=device), diagonal=1)
+    causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+    return causal_mask.expand(batch_size, num_heads, seq_len_q, seq_len_k)
+
+
+def scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0):
+    d_k = q.size(-1)
+    attn_logits = torch.matmul(q, k.transpose(-2, -1)) / torch.sqrt(torch.tensor(d_k, dtype=q.dtype, device=q.device))
+
+    if attn_mask is not None:
+        attn_logits = attn_logits.masked_fill(attn_mask, float('-inf'))
+
+    attn_probs = F.softmax(attn_logits, dim=-1)
+
+    if dropout_p > 0.0:
+        attn_probs = F.dropout(attn_probs, p=dropout_p)
+
+    attn_output = torch.matmul(attn_probs, v)
+
+    return attn_output
+
+
 class CoreAttention(nn.Module):
     def __init__(self, config: LlamaConfig, parallel_config: Optional[ParallelismArgs], layer_idx: int):
         super().__init__()
-        # TODO @thomasw21: GPT has a weird `d_kv` config which I'm guessing is essentically a `d_qkv`
         assert (
             config.hidden_size % config.num_attention_heads == 0
         ), f"Hidden size {config.hidden_size} must be divisible by number of attention heads {config.num_attention_heads}."
         self.d_qk = config.hidden_size // config.num_attention_heads
         self.d_v = config.hidden_size // config.num_attention_heads
 
-        self.checkpoint_attention = False  # Because flash_attn already does checkpointing
+        self.checkpoint_attention = False
 
     @checkpoint_method(attr_name="checkpoint_attention")
     def forward(
         self,
-        query_states: torch.Tensor,  # [batch_size * q_length, n_local_q_heads, inner_dim]
-        key_states: torch.Tensor,  # [batch_size * kv_length, n_local_kv_heads, inner_dim]
-        value_states: torch.Tensor,  # [batch_size * kv_length, n_local_kv_heads, inner_dim]
-        q_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, q_length] (can be broadcasted to that size)
-        kv_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, kv_length] (can be broadcasted to that size)
+        query_states: torch.Tensor,  # [batch_size, n_heads, seq_length, head_dim]
+        key_states: torch.Tensor,    # [batch_size, n_heads, kv_length, head_dim]
+        value_states: torch.Tensor,  # [batch_size, n_heads, kv_length, head_dim]
+        q_sequence_mask: torch.Tensor,  # [batch_size, seq_length]
+        kv_sequence_mask: torch.Tensor, # [batch_size, kv_length]
+        past_key_states: Optional[torch.Tensor] = None,  # [batch_size, n_heads, kv_length_total, head_dim]
+        past_value_states: Optional[torch.Tensor] = None,  # [batch_size, n_heads, kv_length_total, head_dim]
     ):
-        # TODO @thomasw21: Compute once, instead of computing for each layers.
-        cu_seqlens_q = torch.zeros((q_sequence_mask.shape[0] + 1), dtype=torch.int32, device=query_states.device)
-        cu_seqlens_k = torch.zeros((kv_sequence_mask.shape[0] + 1), dtype=torch.int32, device=query_states.device)
-        torch.cumsum(q_sequence_mask.sum(-1, dtype=torch.int32), dim=0, dtype=torch.int32, out=cu_seqlens_q[1:])
-        torch.cumsum(kv_sequence_mask.sum(-1, dtype=torch.int32), dim=0, dtype=torch.int32, out=cu_seqlens_k[1:])
+        batch_size, n_heads, seq_length, head_dim = query_states.size()
+        kv_batch_size, kv_n_heads, kv_seq_length, kv_head_dim = key_states.size()
 
-        # TODO(kunhao): flash attn's causal means that the query can only attend to the keys before it. This is not
-        # what we want if we are using kv cache. This is a hack as we always have q_length == 1 when using kv cache.
-        causal = False if q_sequence_mask.shape[1] == 1 else True
-        attn_output = flash_attn_varlen_func(
+        assert batch_size == kv_batch_size
+        assert n_heads == kv_n_heads
+        assert head_dim == kv_head_dim
+
+        # Concatenate past key and value states if they exist (for inference with caching)
+        if past_key_states is not None and past_value_states is not None:
+            key_states = torch.cat([past_key_states, key_states], dim=2)
+            value_states = torch.cat([past_value_states, value_states], dim=2)
+            kv_sequence_mask = torch.cat([kv_sequence_mask, kv_sequence_mask], dim=1)
+
+        # Create attention mask
+        attn_mask = None
+        device = query_states.device
+
+        # Key padding mask
+        key_padding_mask = ~kv_sequence_mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, kv_length_total]
+
+        # Causal mask
+        causal_mask = create_causal_mask(seq_length, key_states.size(2), batch_size, n_heads, device)
+
+        attn_mask = key_padding_mask | causal_mask
+
+        # Apply scaled dot-product attention
+        attn_output = scaled_dot_product_attention(
             q=query_states,
             k=key_states,
             v=value_states,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=q_sequence_mask.shape[1],
-            max_seqlen_k=kv_sequence_mask.shape[1],
+            attn_mask=attn_mask,
             dropout_p=0.0,
-            softmax_scale=None,  # This already defaults to the scale I'm interested in
-            causal=causal,
-            return_attn_probs=False,
         )
 
-        return attn_output
-
-
-def pad_to_right(tensor, mask, new_tensor=None):
-    """Transform a left-padded tensor into a right-padded tensor. (Useful for prefilling key/value states)
-    Args:
-        tensor: (batch_size, seqlen, d1, d2)
-        mask: (batch_size, seqlen)
-        new_tensor: (batch_size, new_tensor_seqlen, d1, d2)
-    Returns:
-        new_tensor: (batch_size, new_tensor_seqlen, d1, d2)
-        right_padded_mask: (batch_size, seqlen)
-    """
-    # First, we need to find the number of padding for each row
-    unpad_seqlens = mask.sum(1)
-    # Then, we need to find the maximum length of the tensor
-    max_seqlen = mask.shape[1]
-    # We can then create the indices to select the padded values
-    # The indices are the same for each row
-    indices = torch.arange(max_seqlen, device=mask.device)
-    # We can then create the mask for the padded values
-    right_padded_mask = indices < unpad_seqlens[:, None]
-    # We select the useful values
-    useful_values = tensor[mask]
-    # We create the new tensor (if not provided)
-    new_tensor = torch.zeros_like(tensor) if new_tensor is None else new_tensor
-    # We fill the new tensor with the useful values
-    new_tensor[:, : right_padded_mask.shape[1], :, :][right_padded_mask] = useful_values
-    return new_tensor, right_padded_mask
+        return attn_output, key_states, value_states  # Return updated key and value states for caching
 
 
 class CausalSelfAttention(nn.Module, AttachableStore):
@@ -264,7 +248,6 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         layer_idx: int,
     ):
         super().__init__()
-        # Tensor parallel considerations: We split tensors along head dimension
         assert (
             config.num_attention_heads % tp_pg.size() == 0
         ), f"Number of attention heads ({config.num_attention_heads}) must be divisible by TP size ({tp_pg.size()})."
@@ -279,7 +262,6 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 level=logging.WARNING,
                 rank=0,
             )
-            # If num_key_value_heads is not defined, we assume that it is equal to num_attention_heads
             config.num_key_value_heads = config.num_attention_heads
         assert (
             config.num_attention_heads % config.num_key_value_heads == 0
@@ -287,23 +269,20 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         self.n_local_q_heads = config.num_attention_heads // tp_pg.size()
         self.n_local_kv_heads = config.num_key_value_heads // tp_pg.size()
         self.n_repeats = config.num_attention_heads // config.num_key_value_heads
-        self.is_gqa = config.num_attention_heads != config.num_key_value_heads  # Whether we are using GQA or not
+        self.is_gqa = config.num_attention_heads != config.num_key_value_heads
         self.d_qk = config.hidden_size // config.num_attention_heads
         self.d_v = config.hidden_size // config.num_attention_heads
         self.d_model = config.hidden_size
 
-        # TODO @thomasw21: refactor so that we store that default in a single place.
         tp_mode = parallel_config.tp_mode if parallel_config is not None else TensorParallelLinearMode.ALL_REDUCE
         tp_linear_async_communication = (
             parallel_config.tp_linear_async_communication if parallel_config is not None else False
         )
 
-        # build the slice config for self.qkv for save/load
-        # shard are done within the contiguous chunk
         qkv_contiguous_chunks = (
-            config.num_attention_heads * self.d_qk,  # shape of q
-            config.num_key_value_heads * self.d_qk,  # shape of k
-            config.num_key_value_heads * self.d_qk,  # shape of v
+            config.num_attention_heads * self.d_qk,
+            config.num_key_value_heads * self.d_qk,
+            config.num_key_value_heads * self.d_qk,
         )
         self.qkv_proj = TensorParallelColumnLinear(
             self.d_model,
@@ -314,14 +293,11 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             async_communication=tp_linear_async_communication,
             contiguous_chunks=qkv_contiguous_chunks,
         )
-        # TODO(kunhao): We want to have only one version per device and not one version per layer.
+
         self.rotary_embedding = RotaryEmbedding(
             dim=self.d_qk,
             end=config.max_position_embeddings,
         )
-
-        # NOTE: Only supported for training (TODO(fmom): position_ids not supported yet)
-        self.flash_rotary_embedding = FlashRotaryEmbedding(dim=self.d_qk, interleaved=True)
 
         self.o_proj = TensorParallelRowLinear(
             config.num_attention_heads * self.d_qk,
@@ -338,10 +314,6 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             layer_idx=layer_idx,
         )
 
-        self.prefill_kv_len = (
-            config.max_position_embeddings
-        )  # TODO @nouamane: compute based on free memory, because in rope we can surpass max_position_embeddings
-
     def forward(
         self,
         hidden_states,  # [seq_length, batch_size, hidden_size]
@@ -349,7 +321,7 @@ class CausalSelfAttention(nn.Module, AttachableStore):
     ):
         qkv_states = self.qkv_proj(
             hidden_states
-        )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
+        )
         q_length, batch_size, _ = qkv_states.shape
 
         if self.is_gqa:
@@ -373,213 +345,76 @@ class CausalSelfAttention(nn.Module, AttachableStore):
                 value_states.transpose(0, 1).contiguous().view(batch_size, q_length, self.n_local_kv_heads, self.d_qk)
             )
         else:
-            query_states, key_states, value_states = (
-                qkv_states.view(q_length, batch_size, 3, self.n_local_q_heads, self.d_qk)
-                .permute(2, 1, 0, 3, 4)
-                .contiguous()
-            )  # [3, batch_size, seq_length, n_local_q_heads, d_qk]
+            qkv_states = qkv_states.transpose(0, 1).contiguous()
+            query_states, key_states, value_states = torch.chunk(qkv_states, 3, dim=-1)
+            query_states = query_states.view(batch_size, q_length, self.n_local_q_heads, self.d_qk)
+            key_states = key_states.view(batch_size, q_length, self.n_local_kv_heads, self.d_qk)
+            value_states = value_states.view(batch_size, q_length, self.n_local_kv_heads, self.d_qk)
+
+        # Apply rotary embeddings
+        query_states = self.rotary_embedding(query_states, position_ids=None)
+        key_states = self.rotary_embedding(key_states, position_ids=None)
+
+        # Prepare for attention
+        query_states = query_states.permute(0, 2, 1, 3)  # [batch_size, n_q_heads, seq_length, head_dim]
+        key_states = key_states.permute(0, 2, 1, 3)      # [batch_size, n_kv_heads, kv_length, head_dim]
+        value_states = value_states.permute(0, 2, 1, 3)  # [batch_size, n_kv_heads, kv_length, head_dim]
+
+        if self.is_gqa and self.n_local_q_heads != self.n_local_kv_heads:
+            if self.n_local_q_heads % self.n_local_kv_heads == 0:
+                repeat_factor = self.n_local_q_heads // self.n_local_kv_heads
+                key_states = key_states.repeat_interleave(repeat_factor, dim=1)
+                value_states = value_states.repeat_interleave(repeat_factor, dim=1)
+            else:
+                raise ValueError("n_local_q_heads must be divisible by n_local_kv_heads.")
 
         store = self.get_local_store()
         if store is not None:  # Inference case
-            # Double check that we use store only at inference time
-            assert key_states.requires_grad is False
-            assert value_states.requires_grad is False
-            if "position_offsets" in store:
-                old_position_offsets = store["position_offsets"]
-                position_ids = old_position_offsets[:, None] + sequence_mask
+            # Retrieve past key and value states from the store
+            past_key_states = store.get("key_states", None)
+            past_value_states = store.get("value_states", None)
+
+            # Update sequence mask
+            if past_key_states is not None:
+                kv_sequence_mask = torch.cat([store["kv_sequence_mask"], sequence_mask], dim=1)
             else:
-                position_ids = torch.cumsum(sequence_mask, dim=-1, dtype=torch.int32) - 1
-            position_offsets = position_ids[:, -1]
+                kv_sequence_mask = sequence_mask
 
-            # Compute rotary embeddings
-            # Note: keep track of old rotary embedding end to check if we need to enlarge k_cache and v_cache
-            old_rotary_embed_end = self.rotary_embedding.end
-            query_states = self.rotary_embedding(query_states, position_ids=position_ids)
-            key_states = self.rotary_embedding(key_states, position_ids=position_ids)
-
-            if "key" not in store:
-                # First inference iteration (Prefill)
-                # TODO @nouamane: support custom masking
-                # assert that [ False, False, False, False,  True,  True,  True,  True,  True,  True] is accepted
-                # but [ False, False, False, False,  True,  True,  False,  False,  True,  True] is not (can't mask in the middle of sequence)
-                assert ~(
-                    sequence_mask[:, :-1] & (~sequence_mask[:, 1:])  # True is never followed by False
-                ).any(), "Can't mask in the middle of sequence, please make sure that pads are at the left of the sequence if existing"
-
-                # preallocate k_cache, v_cache to self.prefill_kv_len
-                k_cache = torch.zeros(
-                    (
-                        batch_size,
-                        self.prefill_kv_len,
-                        self.n_local_kv_heads,
-                        self.d_qk,
-                    ),
-                    dtype=query_states.dtype,
-                    device=query_states.device,
-                )
-                v_cache = torch.zeros(
-                    (batch_size, self.prefill_kv_len, self.n_local_kv_heads, self.d_v),
-                    dtype=query_states.dtype,
-                    device=query_states.device,
-                )
-                # Remove pad tokens from key_states and concatenate samples in key_unpad
-                # cu_seqlens_k is the cumulative sequence lengths of key_states
-                (query_unpad, indices_q, cu_seqlens_q, max_seqlen_q) = bert_padding.unpad_input(
-                    query_states,
-                    sequence_mask,
-                )
-                (key_unpad, indices_k, cu_seqlens_k, max_seqlen_k) = bert_padding.unpad_input(
-                    key_states, sequence_mask
-                )
-                (value_unpad, _, _, _) = bert_padding.unpad_input(value_states, sequence_mask)
-
-                output_unpad = flash_attn_varlen_func(
-                    q=query_unpad,  # (total_q, n_local_q_heads, d_qk)
-                    k=key_unpad,  # (total_kv, n_local_kv_heads, d_qk)
-                    v=value_unpad,  # (total_kv, n_local_kv_heads, d_v)
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    dropout_p=0.0,
-                    softmax_scale=None,
-                    causal=True,  # True in prefill phase, False in subsequent phases
-                    return_attn_probs=False,
-                )  # (total_unpadded, n_local_q_heads, d_v)
-
-                attention_output = bert_padding.pad_input(
-                    output_unpad, indices_q, batch_size, q_length
-                )  # (batch_size, q_length, n_local_q_heads, d_v)
-
-                pad_to_right(key_states, sequence_mask, new_tensor=k_cache)
-                pad_to_right(value_states, sequence_mask, new_tensor=v_cache)
-
-            else:
-                # Pull pre-computed key/value states
-                # Subsequent inference iterations (q_length=1)
-                k_cache = store["key"]
-                v_cache = store["value"]
-
-                # NOTE(fmom): According to flash_attn_with_kvcache, "If you pass in k / v, you must make sure that the cache is large enough to hold the new values"
-                # Since rotary embedding has changed (to enable larger context), we need to enlarge k_cache and v_cache
-                if self.rotary_embedding.end > old_rotary_embed_end:
-                    k_cache = torch.cat(
-                        [
-                            k_cache,
-                            torch.zeros(
-                                (
-                                    batch_size,
-                                    self.rotary_embedding.end - old_rotary_embed_end,
-                                    self.n_local_kv_heads,
-                                    self.d_qk,
-                                ),
-                                dtype=query_states.dtype,
-                                device=query_states.device,
-                            ),
-                        ],
-                        dim=1,
-                    )
-
-                    v_cache = torch.cat(
-                        [
-                            v_cache,
-                            torch.zeros(
-                                (
-                                    batch_size,
-                                    self.rotary_embedding.end - old_rotary_embed_end,
-                                    self.n_local_kv_heads,
-                                    self.d_v,
-                                ),
-                                dtype=query_states.dtype,
-                                device=query_states.device,
-                            ),
-                        ],
-                        dim=1,
-                    )
-
-                assert (
-                    k_cache.shape[1] == self.rotary_embedding.end
-                ), f"Cache size {k_cache.shape[1]} is smaller than rotary embedding end {self.rotary_embedding.end}"
-                assert (
-                    v_cache.shape[1] == self.rotary_embedding.end
-                ), f"Cache size {v_cache.shape[1]} is smaller than rotary embedding end {self.rotary_embedding.end}"
-
-                # [batch_size, seq_length, num_heads, d_qk]
-                query_states = query_states.view(
-                    batch_size, q_length, self.n_local_q_heads, self.d_qk
-                )  # [batch_size, q_length, self.n_heads, d_qk]
-                kv_length = key_states.shape[1]
-                key_states = key_states.view(
-                    batch_size, kv_length, self.n_local_kv_heads, self.d_qk
-                )  # [batch_size, kv_length, self.n_heads, d_qk]
-                value_states = value_states.view(
-                    batch_size, kv_length, self.n_local_kv_heads, self.d_v
-                )  # [batch_size, kv_length, self.n_heads, d_v]
-
-                attention_output = flash_attn_with_kvcache(
-                    query_states,
-                    k_cache,
-                    v_cache,
-                    key_states,
-                    value_states,
-                    rotary_cos=None,
-                    rotary_sin=None,
-                    # TODO @nouamane: seems like this doesnt help to indicate padding in (for first iteration it's just 0)
-                    cache_seqlens=position_offsets.contiguous(),
-                    softmax_scale=None,
-                    causal=True,
-                    rotary_interleaved=False,  # GPT-NeoX style
-                )
-
-            store.update(
-                {
-                    "key": k_cache,  # flash-attn has updated with new key_states using cache_seqlens
-                    "value": v_cache,
-                    "position_offsets": position_offsets,
-                }
-            )
-
-        else:  # Training case
-            # Apply rotary embeddings to query/key states
-            # NOTE: The layout is different from models/llama.py which is [batch_size, num_heads, seq_length, d_qk]
-            # Here it is, [batch_size, seq_length, num_heads, d_qk]
-            # [2, batch_size, seq_length, num_heads, d_qk]
-            key_value_states = torch.cat([key_states.unsqueeze(0), value_states.unsqueeze(0)], dim=0)
-            # [batch_size, seq_length, 2, num_heads, d_qk]
-            key_value_states = key_value_states.permute(1, 2, 0, 3, 4).contiguous()
-            query_states, key_value_states = self.flash_rotary_embedding(query_states, kv=key_value_states)
-            # [batch_size, seq_length, num_heads, d_qk]
-            key_states, value_states = torch.split(key_value_states, 1, dim=2)
-
-            q_sequence_mask = sequence_mask
-            kv_sequence_mask = sequence_mask
-
-            kv_length = key_states.shape[1]
-            # [batch_size, seq_length, num_heads, d_qk]
-            # Shaping for use in `flash-attn` version of flash-attn: `flash_attn_unpadded_func`
-            query_states = query_states.view(
-                batch_size * q_length, self.n_local_q_heads, self.d_qk
-            )  # [batch_size * q_length, self.n_heads, d_qk]
-
-            key_states = key_states.view(
-                batch_size * kv_length, self.n_local_kv_heads, self.d_qk
-            )  # [batch_size * kv_length, self.n_heads, d_qk]
-            value_states = value_states.view(
-                batch_size * kv_length, self.n_local_kv_heads, self.d_v
-            )  # [batch_size * kv_length, self.n_heads, d_v]
-
-            attention_output = self.attention(
+            # Compute attention output with caching
+            attn_output, updated_key_states, updated_value_states = self.attention(
                 query_states=query_states,
                 key_states=key_states,
                 value_states=value_states,
-                q_sequence_mask=q_sequence_mask,
+                q_sequence_mask=sequence_mask,
                 kv_sequence_mask=kv_sequence_mask,
+                past_key_states=past_key_states,
+                past_value_states=past_value_states,
             )
 
-        attention_output = (
-            attention_output.contiguous().view(batch_size, q_length, self.n_local_q_heads * self.d_v).transpose(0, 1)
-        )
-        output = self.o_proj(attention_output)
+            # Update the store with new key and value states
+            store["key_states"] = updated_key_states
+            store["value_states"] = updated_value_states
+            store["kv_sequence_mask"] = kv_sequence_mask
+
+        else:  # Training case
+            # Compute attention output without caching
+            attn_output, _, _ = self.attention(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                q_sequence_mask=sequence_mask,
+                kv_sequence_mask=sequence_mask,
+            )
+
+        # Reshape and project the output
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
+        attn_output = attn_output.view(batch_size, q_length, -1)
+        attn_output = attn_output.transpose(0, 1).contiguous()
+        if not torch.isnan(attn_output[0][0][0]):
+            print("ANSU")
+            print(attn_output)
+
+        output = self.o_proj(attn_output)
 
         return {"hidden_states": output, "sequence_mask": sequence_mask}
 
@@ -610,9 +445,20 @@ class LlamaDecoderLayer(nn.Module):
         sequence_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
         residual = hidden_states
+        is_mem = False
+                
+        if not torch.isnan(hidden_states[0][0][0]):
+            print("LOOOH PIDOR")
+            is_mem = True
+            print(hidden_states)
         hidden_states = self.input_layernorm(hidden_states)
 
+
         output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask)
+        if is_mem:
+            print("MATKA BOSKA")
+            print(output)
+
         hidden_states = output["hidden_states"]
         hidden_states = hidden_states + residual
 
@@ -648,10 +494,8 @@ class Embedding(nn.Module, AttachableStore):
                 past_length = torch.zeros(1, dtype=torch.long, device=input_ids.device).expand(input_ids.shape[0])
 
             cumsum_mask = input_mask.cumsum(-1, dtype=torch.long)
-            # Store new past_length in store
             store["past_length"] = past_length + cumsum_mask[:, -1]
 
-        # Format input in `[seq_length, batch_size]` to support high TP with low batch_size
         input_ids = input_ids.transpose(0, 1)
         input_embeds = self.token_embedding(input_ids)
         return {"input_embeds": input_embeds}
@@ -668,7 +512,6 @@ class LlamaModel(nn.Module):
     ):
         super().__init__()
 
-        # Declare all the nodes
         self.p2p = P2P(parallel_context.pp_pg, device=torch.device("cuda"))
         self.config = config
         self.parallel_config = parallel_config
@@ -714,18 +557,16 @@ class LlamaModel(nn.Module):
             module_kwargs={"hidden_size": config.hidden_size, "eps": config.rms_norm_eps},
             module_input_keys={"input"},
             module_output_keys={"hidden_states"},
-        )  # TODO
+        )
 
         self.lm_head = PipelineBlock(
             p2p=self.p2p,
-            # Understand that this means that we return sharded logits that are going to need to be gathered
             module_builder=TensorParallelColumnLinear,
             module_kwargs={
                 "in_features": config.hidden_size,
                 "out_features": config.vocab_size,
                 "pg": parallel_context.tp_pg,
                 "bias": False,
-                # TODO @thomasw21: refactor so that we store that default in a single place.
                 "mode": self.tp_mode,
                 "async_communication": tp_linear_async_communication,
             },
@@ -743,19 +584,19 @@ class LlamaModel(nn.Module):
 
     def forward(
         self,
-        input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
-        input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
+        input_ids: Union[torch.Tensor, TensorPointer],
+        input_mask: Union[torch.Tensor, TensorPointer],
     ):
         return self.forward_with_hidden_states(input_ids=input_ids, input_mask=input_mask)[0]
 
     def forward_with_hidden_states(
         self,
-        input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
-        input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
+        input_ids: Union[torch.Tensor, TensorPointer],
+        input_mask: Union[torch.Tensor, TensorPointer],
     ):
-        # all tensors are optional as most ranks don't need anything from the dataloader.
-
         output = self.token_position_embeddings(input_ids=input_ids, input_mask=input_mask)
+        print(output)
+        print("MEKFEKFLEKFEK")
 
         hidden_encoder_states = {
             "hidden_states": output["input_embeds"],
@@ -790,15 +631,15 @@ class LlamaModel(nn.Module):
         """Get flops per second for a given model"""
         world_size = self.parallel_context.world_pg.size()
         try:
-            num_key_values_heads = self.config.num_key_value_heads
+            num_key_value_heads = self.config.num_key_value_heads
         except AttributeError:
-            num_key_values_heads = self.config.num_attention_heads
+            num_key_value_heads = self.config.num_attention_heads
 
         model_flops, hardware_flops = get_flops(
             num_layers=self.config.num_hidden_layers,
             hidden_size=self.config.hidden_size,
             num_heads=self.config.num_attention_heads,
-            num_key_value_heads=num_key_values_heads,
+            num_key_value_heads=num_key_value_heads,
             vocab_size=self.config.vocab_size,
             ffn_hidden_size=self.config.intermediate_size,
             seq_len=sequence_length,
@@ -832,10 +673,7 @@ class Loss(nn.Module):
         loss = sharded_cross_entropy(
             sharded_logits, label_ids.transpose(0, 1).contiguous(), group=self.tp_pg, dtype=torch.float
         ).transpose(0, 1)
-        # TODO @thomasw21: It's unclear what kind of normalization we want to do.
         loss = masked_mean(loss, label_mask, dtype=torch.float)
-        # I think indexing causes a sync we don't actually want
-        # loss = loss[label_mask].sum()
         return {"loss": loss}
 
 
@@ -901,12 +739,6 @@ class LlamaForTraining(NanotronModel):
 
         for module_name, module in model.named_modules():
             if isinstance(module, TensorParallelColumnLinear):
-                # Somehow Megatron-LM does something super complicated, https://github.com/NVIDIA/Megatron-LM/blob/2360d732a399dd818d40cbe32828f65b260dee11/megatron/core/tensor_parallel/layers.py#L96
-                # What it does:
-                #  - instantiate a buffer of the `full size` in fp32
-                #  - run init method on it
-                #  - shard result to get only a specific shard
-                # Instead I'm lazy and just going to run init_method, since they are scalar independent
                 assert {"weight"} == {name for name, _ in module.named_parameters()} or {"weight"} == {
                     name for name, _ in module.named_parameters()
                 }
@@ -921,7 +753,6 @@ class LlamaForTraining(NanotronModel):
                         full_param_name = f"{module_name}.{param_name}"
 
                     if full_param_name in initialized_parameters:
-                        # Already initialized
                         continue
 
                     if "weight" == param_name:
@@ -929,17 +760,11 @@ class LlamaForTraining(NanotronModel):
                     elif "bias" == param_name:
                         param.zero_()
                     else:
-                        raise ValueError(f"Who the fuck is {param_name}?")
+                        raise ValueError(f"Unexpected parameter {param_name}.")
 
                     assert full_param_name not in initialized_parameters
                     initialized_parameters.add(full_param_name)
             elif isinstance(module, TensorParallelRowLinear):
-                # Somehow Megatron-LM does something super complicated, https://github.com/NVIDIA/Megatron-LM/blob/2360d732a399dd818d40cbe32828f65b260dee11/megatron/core/tensor_parallel/layers.py#L96
-                # What it does:
-                #  - instantiate a buffer of the `full size` in fp32
-                #  - run init method on it
-                #  - shard result to get only a specific shard
-                # Instead I'm lazy and just going to run init_method, since they are scalar independent
                 assert {"weight"} == {name for name, _ in module.named_parameters()} or {"weight"} == {
                     name for name, _ in module.named_parameters()
                 }
@@ -954,7 +779,6 @@ class LlamaForTraining(NanotronModel):
                         full_param_name = f"{module_name}.{param_name}"
 
                     if full_param_name in initialized_parameters:
-                        # Already initialized
                         continue
 
                     if "weight" == param_name:
@@ -962,7 +786,7 @@ class LlamaForTraining(NanotronModel):
                     elif "bias" == param_name:
                         param.zero_()
                     else:
-                        raise ValueError(f"Who the fuck is {param_name}?")
+                        raise ValueError(f"Unexpected parameter {param_name}.")
 
                     assert full_param_name not in initialized_parameters
                     initialized_parameters.add(full_param_name)
@@ -979,27 +803,18 @@ class LlamaForTraining(NanotronModel):
                         full_param_name = f"{module_name}.{param_name}"
 
                     if full_param_name in initialized_parameters:
-                        # Already initialized
                         continue
 
                     if "weight" == param_name:
-                        # TODO @thomasw21: Sometimes we actually want 0
                         param.fill_(1)
                     elif "bias" == param_name:
                         param.zero_()
                     else:
-                        raise ValueError(f"Who the fuck is {param_name}?")
+                        raise ValueError(f"Unexpected parameter {param_name}.")
 
                     assert full_param_name not in initialized_parameters
                     initialized_parameters.add(full_param_name)
             elif isinstance(module, TensorParallelEmbedding):
-                # TODO @thomasw21: Handle tied embeddings
-                # Somehow Megatron-LM does something super complicated, https://github.com/NVIDIA/Megatron-LM/blob/2360d732a399dd818d40cbe32828f65b260dee11/megatron/core/tensor_parallel/layers.py#L96
-                # What it does:
-                #  - instantiate a buffer of the `full size` in fp32
-                #  - run init method on it
-                #  - shard result to get only a specific shard
-                # Instead I'm lazy and just going to run init_method, since they are scalar independent
                 assert {"weight"} == {name for name, _ in module.named_parameters()}
 
                 assert isinstance(module.weight, NanotronParameter)
@@ -1012,7 +827,6 @@ class LlamaForTraining(NanotronModel):
                     full_param_name = f"{module_name}.weight"
 
                 if full_param_name in initialized_parameters:
-                    # Already initialized
                     continue
 
                 init_method(module.weight)
@@ -1024,7 +838,7 @@ class LlamaForTraining(NanotronModel):
             if param.is_tied
             else name
             for name, param in model.named_parameters()
-        }, f"Somehow the initialized set of parameters don't match:\n - Expected: { {name for name, _ in model.named_parameters()} }\n - Got: {initialized_parameters}"
+        }, f"Some parameters were not initialized."
 
     def get_embeddings_lm_head_tied_names(self):
         """Get the names of the tied embeddings and lm_head weights"""
@@ -1052,7 +866,7 @@ def get_flops(
     ffn_hidden_size,
     batch_size=1,
 ):
-    """Counts flops in an decoder-only model
+    """Counts flops in a decoder-only model
     Args:
         num_layers: number of decoder layers
         hidden_size: hidden size of the model
@@ -1064,32 +878,23 @@ def get_flops(
         batch_size: batch size
     Returns:
         model_flops: flops in the model (should be independent of the hardware and model implementation)
-        hardware_flops: flops in the hardware (actual flops performed on the hardware). Check 6.3 in https://arxiv.org/pdf/2205.05198.pdf
+        hardware_flops: flops in the hardware (actual flops performed on the hardware)
     """
     if num_key_value_heads is None:
         num_key_value_heads = num_heads
     hidden_size_per_head = hidden_size // num_heads
-    # In the following we mark the reduced dimension with parentheses
-    # decoder
-    # self attention
-    ## qkv projection
+    # Self-attention computations
     decoder_qkv_proj_flops_fwd = (
-        2 * num_layers * batch_size * seq_len * (hidden_size) * num_heads * hidden_size_per_head
-        + 2 * num_layers * batch_size * seq_len * (hidden_size) * 2 * num_key_value_heads * hidden_size_per_head
+        2 * num_layers * batch_size * seq_len * hidden_size * (hidden_size * 3)
     )
-    ## qk logits
-    decoder_qk_logits_flops_fwd = 2 * num_layers * batch_size * num_heads * seq_len * (hidden_size_per_head) * seq_len
-    ## v logits
-    decoder_v_logits_flops_fwd = 2 * num_layers * batch_size * num_heads * seq_len * (seq_len) * hidden_size_per_head
-    ## attn out
+    decoder_qk_logits_flops_fwd = 2 * num_layers * batch_size * num_heads * seq_len * seq_len * hidden_size_per_head
+    decoder_v_logits_flops_fwd = 2 * num_layers * batch_size * num_heads * seq_len * seq_len * hidden_size_per_head
     decoder_attn_out_flops_fwd = (
-        2 * num_layers * batch_size * num_heads * seq_len * (hidden_size_per_head) * hidden_size
+        2 * num_layers * batch_size * seq_len * hidden_size * hidden_size
     )
-    # FF
-    ## 1st layer
-    decoder_ffn_1_flops_fwd = 4 * num_layers * batch_size * seq_len * (hidden_size) * ffn_hidden_size
-    ## 2nd layer
-    decoder_ffn_2_flops_fwd = 2 * num_layers * batch_size * seq_len * (ffn_hidden_size) * hidden_size
+    # Feed-forward network computations
+    decoder_ffn_1_flops_fwd = 2 * num_layers * batch_size * seq_len * hidden_size * ffn_hidden_size
+    decoder_ffn_2_flops_fwd = 2 * num_layers * batch_size * seq_len * ffn_hidden_size * hidden_size
 
     decoder_flops_fwd = (
         decoder_qkv_proj_flops_fwd
@@ -1100,13 +905,12 @@ def get_flops(
         + decoder_ffn_2_flops_fwd
     )
 
-    # lm head
-    lm_head_flops_fwd = 2 * batch_size * seq_len * (hidden_size) * vocab_size
+    # LM head computations
+    lm_head_flops_fwd = 2 * batch_size * seq_len * hidden_size * vocab_size
 
-    # the bwd pass requires double the flops in case of matmuls to calculate the gradients with respect to
-    # both input and weight tensors
-    model_flops = 3 * (decoder_flops_fwd + lm_head_flops_fwd)  # 1 for fwd + 2 for bwd
+    # Total flops (forward and backward)
+    model_flops = 3 * (decoder_flops_fwd + lm_head_flops_fwd)
 
-    hardware_flops = model_flops  # TODO: This is a placeholder for now
+    hardware_flops = model_flops  # Placeholder
 
     return model_flops, hardware_flops

@@ -19,6 +19,8 @@ from .llama import (
     LlamaForDoReMiTraining,
     LLaMaForInference,
     LlamaReferenceForTrainingWithPerDomainLoss,
+    Gpt2ForInference,
+    Gpt2ForDoReMiTraining,
 )
 
 try:
@@ -73,26 +75,22 @@ class DoReMiTrainer(DistributedTrainer):
             f"[DoReMi] Initial domain weights: {self.doremi_context.domain_weights}", logger=logger, level=logging.INFO
         )
 
-        model = self._init_model(
-            model_builder=lambda: LlamaForDoReMiTraining(
+        model =  Gpt2ForDoReMiTraining(
                 config=self.model_config,
                 parallel_context=self.parallel_context,
                 parallel_config=self.config.parallelism,
                 doremi_context=self.doremi_context,
-            ),
-        )
+            )
 
         log_rank("[DoReMi] Initializing reference model for DoReMi training", logger=logger, level=logging.INFO)
 
-        self.ref_model = self._init_model(
-            model_builder=lambda: LLaMaForInference(
+        self.ref_model = Gpt2ForInference(
                 config=self.model_config,
                 parallel_config=self.config.parallelism,
                 parallel_context=self.parallel_context,
-            ),
-        )
+            )
 
-        if self.ref_checkpoint_path is not None:
+        if self.ref_checkpoint_path is not None and False:
             normalized_ref_model = (
                 self.ref_model.module
                 if isinstance(self.ref_model.module, DistributedDataParallel)

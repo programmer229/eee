@@ -46,7 +46,7 @@ def clip_grad_norm(
         grads = [
             grad_accumulator.get_grad_buffer(name)
             for name, p in named_parameters
-            if not p.is_tied or world_rank == p.get_tied_info().global_ranks[0]
+            if  True
         ]
 
     # Calculate gradient norm

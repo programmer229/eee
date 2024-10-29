@@ -17,6 +17,7 @@ from nanotron.parallel.tensor_parallel.nn import (
     TensorParallelEmbedding,
     TensorParallelRowLinear,
 )
+from nanotron.parallel.pipeline_parallel.p2p import P2P
 
 from .doremi_context import DoReMiContext
 from .loss import CrossEntropyWithPerDomainLoss, DoReMiLossForProxyTraining
@@ -176,6 +177,102 @@ class BaseLLaMa(NanotronModel):
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
         """Get flops per second for a given model"""
         return self.model.get_flops_per_sec(iteration_time_in_sec, sequence_length, global_batch_size)
+from transformers import GPT2Config, GPT2Model, GPT2LMHeadModel
+
+class Gpt2ForInference(NanotronModel):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        parallel_config: Optional[ParallelismArgs],
+        parallel_context: ParallelContext,
+    ):
+        super().__init__()
+        config = GPT2Config()
+
+        self.model = GPT2LMHeadModel.from_pretrained('gpt2').to('cuda').half()
+        self.parallel_context = parallel_context
+
+
+    def forward(
+        self,
+        input_ids: Union[torch.Tensor, TensorPointer],
+        input_mask: Union[torch.Tensor, TensorPointer],
+        label_ids: Union[torch.Tensor, TensorPointer],
+        label_mask: Union[torch.Tensor, TensorPointer],
+    ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        sharded_logits = self.model(
+            input_ids=input_ids,
+        ).logits.transpose(0, 1).contiguous()
+        print(sharded_logits.shape,label_ids.transpose(0, 1).contiguous().shape)
+        loss = sharded_cross_entropy(
+            sharded_logits,
+            label_ids.transpose(0, 1).contiguous(),
+            group=self.parallel_context.tp_pg,
+            #dtype=torch.float,
+        ).transpose(0, 1)
+        return {"losses": loss}
+    def init_model_randomly(self, init_method, scaled_init_method):
+        pass
+
+class Gpt2ForDoReMiTraining(NanotronModel):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        parallel_context: ParallelContext,
+        doremi_context: DoReMiContext,
+        parallel_config: Optional[ParallelismArgs],
+    ):
+        super().__init__()
+        config = GPT2Config()
+        self.p2p = P2P(parallel_context.pp_pg, device=torch.device("cuda"))
+        self.rank = 0
+        self.model = GPT2LMHeadModel(config).to('cuda').half()
+        self.loss = PipelineBlock(
+            p2p=self.p2p,
+            module_builder=DoReMiLossForProxyTraining,
+            module_kwargs={
+                "parallel_context": parallel_context,
+                "doremi_context": doremi_context,
+            },
+            module_input_keys={
+                "sharded_logits",
+                "label_ids",
+                "label_mask",
+                "domain_idxs",
+                "ref_losses",
+            },
+            module_output_keys={"loss", "excess_losses", "domain_losses", "domain_weights", "samples_per_domain"},
+        )
+        self.loss.build_and_set_rank(0)
+        self.parallel_context = parallel_context
+        self.config = config
+        self.parallel_config = parallel_config
+
+    def forward(
+        self,
+        input_ids: Union[torch.Tensor, TensorPointer],
+        input_mask: Union[torch.Tensor, TensorPointer],
+        label_ids: Union[torch.Tensor, TensorPointer],
+        label_mask: Union[torch.Tensor, TensorPointer],
+        domain_idxs: Optional[Union[torch.Tensor, TensorPointer]],
+        ref_losses: Optional[Union[torch.Tensor, TensorPointer]],
+    ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        sharded_logits = self.model(
+            input_ids=input_ids,
+        ).logits
+        sharded_logits = sharded_logits.contiguous()
+        outputs = self.loss(
+            sharded_logits=sharded_logits,
+            label_ids=label_ids,
+            label_mask=label_mask,
+            domain_idxs=domain_idxs,
+            ref_losses=ref_losses,
+        )
+        return outputs
+    def init_model_randomly(self, init_method, scaled_init_method):
+        pass
+    def get_flops_per_sec(*args, **kwargs):
+        return 0, 0
 
 
 class LLaMaForInference(BaseLLaMa):

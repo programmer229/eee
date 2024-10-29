@@ -36,6 +36,7 @@ class TritonRMSNorm(nn.Module):
     def forward(
         self, input, residual=None, dropout_p=0.0, prenorm=False, residual_in_fp32=False, return_dropout_mask=False
     ):
+        #print(self.weight)
         return layer_norm_fn(
             input,
             self.weight,

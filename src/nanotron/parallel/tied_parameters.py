@@ -121,6 +121,7 @@ def sync_tied_weights_gradients(
     parallel_context: ParallelContext,
     grad_accumulator: Optional[GradientAccumulator],
 ):
+    return
     tied_id_to_param = get_tied_id_to_param(
         parameters=[param for param in module.parameters() if param.requires_grad], root_module=module
     )

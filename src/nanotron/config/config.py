@@ -181,7 +181,7 @@ class ModelArgs:
 
     def __post_init__(self):
         if self.dtype is None:
-            self.dtype = torch.bfloat16
+            self.dtype = torch.float16
         if isinstance(self.dtype, str):
             self.dtype = cast_str_to_torch_dtype(self.dtype)
 

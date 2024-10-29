@@ -92,7 +92,7 @@ class NanotronModel(nn.Module, metaclass=ABCMeta):
             if not isinstance(module, PipelineBlock):
                 continue
             log_rank(
-                f"module_name: {name} | PP: {module.rank}/{self.parallel_context.pp_pg.size()}",
+                f"module_name: {name} | PP: {0}/{self.parallel_context.pp_pg.size()}",
                 logger=logger,
                 level=level,
                 group=group,

@@ -85,8 +85,18 @@ class DataCollatorForCLM:
                 "label_mask": TensorPointer(self.output_pp_rank),
             }
 
-        assert all(list(example.keys()) == ["input_ids", "domain_ids"] for example in examples)
-
+        #assert all(list(example.keys()) == ["input_ids", "domain_ids"] for example in examples)
+        for i in range(len(examples)):
+            input_ids = examples[i]["input_ids"]
+                    # Pad the input_ids with zeros until it reaches max_length
+            max_length = 257
+            if len(input_ids) < max_length:
+                # Pad input_ids with zeros
+                padded_input_ids = np.concatenate([input_ids , np.zeros((max_length - len(input_ids)), np.int64)])
+            else:
+                # Truncate input_ids to max_length
+                padded_input_ids = input_ids[:max_length]
+            examples[i]["input_ids"] = padded_input_ids
         input_ids = np.vstack([examples[i]["input_ids"] for i in range(len(examples))])  # (b, s)
         batch_size, expanded_input_length = input_ids.shape
 
@@ -330,7 +340,6 @@ def get_dataloader(trainer: DistributedTrainer, datasets) -> DataLoader:
         parallel_context=parallel_context,
         doremi_context=doremi_context,
     )
-
     sampler = DistributedSamplerForDoReMi(
         datasets,
         batch_size=trainer.micro_batch_size,
@@ -344,6 +353,14 @@ def get_dataloader(trainer: DistributedTrainer, datasets) -> DataLoader:
     )
 
     comebined_dataset = CombinedDataset(datasets)
+    class InfiniteDataset(CombinedDataset):
+        def __init__(self, dataset):
+            self.dataset = dataset
+
+        def __iter__(self):
+            while True:
+                for sample in self.dataset:
+                    yield sample
 
     dataloader = DataLoader(
         comebined_dataset,
@@ -353,6 +370,8 @@ def get_dataloader(trainer: DistributedTrainer, datasets) -> DataLoader:
         pin_memory=True,
         worker_init_fn=get_dataloader_worker_init(dp_rank=dist.get_rank(parallel_context.dp_pg)),
     )
+    import itertools
+    dataloader = itertools.cycle(dataloader)
 
     def _data_generator(dataloader):
         def inner():

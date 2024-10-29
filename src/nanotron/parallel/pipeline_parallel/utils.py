@@ -9,8 +9,8 @@ def get_input_output_pp_ranks(model: NanotronModel | DistributedDataParallel):
         input_pp_rank = model.module.input_pp_rank
         output_pp_rank = model.module.output_pp_rank
     else:
-        input_pp_rank = model.input_pp_rank
-        output_pp_rank = model.output_pp_rank
+        input_pp_rank = 0
+        output_pp_rank = 0
     return input_pp_rank, output_pp_rank
 
 

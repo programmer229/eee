@@ -73,6 +73,7 @@ class DomainLossForProxyTraining:
         )
 
         domain_weights = self.doremi_context.domain_weights
+        print(domain_weights)
         step_size = self.doremi_context.step_size
         smoothing_param = self.doremi_context.smoothing_param
         log_new_domain_weights = torch.log(domain_weights) + step_size * normalized_domain_losses
@@ -80,6 +81,7 @@ class DomainLossForProxyTraining:
         train_domain_weights = (1 - smoothing_param) * torch.exp(log_new_domain_weights) + smoothing_param / len(
             log_new_domain_weights
         )
+        print(train_domain_weights,43, normalized_domain_losses, samples_per_domain)
         return excess_losses_dp, normalized_domain_losses, train_domain_weights, samples_per_domain
 
 

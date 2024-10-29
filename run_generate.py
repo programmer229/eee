@@ -96,7 +96,7 @@ def main():
     log_rank(f"model_config: {model_config}", logger=logger, level=logging.INFO, rank=0)
     log_rank(f"tokenizer_path: {tokenizer_path}", logger=logger, level=logging.INFO, rank=0)
 
-    dtype = torch.bfloat16
+    dtype = torch.float16
 
     # Set random states
     set_random_seed(42)

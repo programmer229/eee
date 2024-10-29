@@ -151,7 +151,6 @@ class CoreAttention(nn.Module):
 
         # TODO(kunhao): flash attn's causal means that the query can only attend to the keys before it. This is not
         # what we want if we are using kv cache. This is a hack as we always have q_length == 1 when using kv cache.
-        causal = False if q_sequence_mask.shape[1] == 1 else True
         attn_output = flash_attn_varlen_func(
             q=query_states,
             k=key_states,

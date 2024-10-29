@@ -57,6 +57,7 @@ class _ShardedCrossEntropy(torch.autograd.Function):
         # Get predicted-logits = logits[target].
         # For Simplicity, we convert logits to a 2-D tensor with size
         # [*, shard-size] and target to a 1-D tensor of size [*].
+        print(sharded_logits.shape)
         logits_2d = sharded_logits.view(-1, sharded_hidden_size)
         masked_target_1d = masked_target.view(-1)
         arange_1d = torch.arange(start=0, end=logits_2d.shape[0], device=logits_2d.device)

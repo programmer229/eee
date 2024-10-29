@@ -177,7 +177,7 @@ class DistributedTrainer:
         self.optimizer, self.grad_accumulator = init_optimizer_and_grad_accumulator(
             model=self.model, optimizer_args=self.config.optimizer, parallel_context=self.parallel_context
         )
-        if self.init_checkpoint_path is not None:
+        if False and self.init_checkpoint_path is not None:
             load_optimizer(
                 optimizer=self.optimizer,
                 parallel_context=self.parallel_context,
@@ -192,7 +192,7 @@ class DistributedTrainer:
             lr_scheduler_args=self.config.optimizer.learning_rate_scheduler,
             total_training_steps=self.config.tokens.train_steps,
         )
-        if self.init_checkpoint_path is not None:
+        if False and self.init_checkpoint_path is not None:
             load_lr_scheduler(
                 lr_scheduler=self.lr_scheduler,
                 root_folder=self.init_checkpoint_path,
@@ -201,7 +201,7 @@ class DistributedTrainer:
         # Define iteration start state
         self.start_iteration_step: int
         self.consumed_train_samples: int
-        if self.init_checkpoint_path is not None:
+        if False and self.init_checkpoint_path is not None:
             checkpoint_metadata = load_meta(
                 parallel_context=self.parallel_context, root_folder=self.init_checkpoint_path
             )
@@ -217,12 +217,12 @@ class DistributedTrainer:
 
         # Setup tensorboard write and log writers on output rank
         self.logger_ranks = self.parallel_context.world_rank_matrix[
-            0, self.unwrapped_model.output_pp_rank, 0, 0
+            0, 0, 0, 0
         ].flatten()
         self.loggerwriter = self.setup_log_writers()
 
         # Log where each module is instantiated
-        self.unwrapped_model.log_modules(level=logging.DEBUG, group=self.parallel_context.world_pg, rank=0)
+        self.unwrapped_model.log_modules(level=logging.DEBUG, group=self.parallel_context.world_pg, rank =0)
 
         self.micro_batch_size = self.config.tokens.micro_batch_size
         self.n_micro_batches_per_batch = self.config.tokens.batch_accumulation_per_replica
@@ -370,11 +370,12 @@ class DistributedTrainer:
         # Clip gradients
         if self.config.optimizer.clip_grad is not None:
             # Unwrap DDP
-            named_parameters = [
-                (name, param)
-                for name, param in self.unwrapped_model.get_named_params_with_correct_tied()
-                if param.requires_grad
-            ]
+            #named_parameters = [
+            #    (name, param)
+            #    for name, param in self.unwrapped_model.get_named_params_with_correct_tied()
+            #    if param.requires_grad
+            #]
+            named_parameters = self.unwrapped_model.named_parameters()
             self.grad_norm_unclipped = clip_grad_norm(
                 mp_pg=self.parallel_context.mp_pg,
                 named_parameters=named_parameters,
@@ -562,6 +563,7 @@ class DistributedTrainer:
 
     def _load_model_checkpoint(self, model: NanotronModel) -> NanotronModel:
         unwrapped_model = model.module if isinstance(model, DistributedDataParallel) else model
+        return model
 
         # Load or initialize model weights
         self.init_checkpoint_path = parse_ckpt_path(config=self.config)

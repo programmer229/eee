@@ -167,7 +167,7 @@ def init_optimizer_and_grad_accumulator(
     module_id_to_prefix[id(unwrapped_model)] = ""
 
     # named parameters
-    named_parameters = list(unwrapped_model.get_named_params_with_correct_tied())
+    named_parameters = list(unwrapped_model.named_parameters())
 
     # Basic optimizer builder
     def basic_optimizer_builder(named_param_groups):
